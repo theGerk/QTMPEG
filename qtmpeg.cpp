@@ -53,77 +53,88 @@ public:
     std::thread* encoder;
     bool running = true;
 
+    void encode_thread() {
+        while(running) {
+            std::unique_lock<std::mutex> l(mtx);
+            evt.wait(l);
+            std::queue<QVideoFrame> frames = pendingFrames;
+            pendingFrames = std::queue<QVideoFrame>();
+            l.unlock();
+            while(frames.size()) {
+                QVideoFrame frame = frames.front();
+                frames.pop();
+                AVPixelFormat fmt = AV_PIX_FMT_YUV420P;
+                format = fmt;
+                if(encodeCtx == nullptr) {
+                    codec_init(frame.width(),frame.height());
+                }
+                if(!(frame.width() == encodeCtx->width && frame.height() == encodeCtx->height)) {
+                    codec_init(frame.width(),frame.height());
+                }
+                AVFrame* aframe = av_frame_alloc();
+                AVFrame* hwframe = 0;
+                aframe->pts = ((double)frame.startTime()/1000.0/1000.0)*60.0;
+                aframe->width = frame.width();
+                aframe->height = frame.height();
+                aframe->format = fmt;
+                av_image_fill_linesizes(aframe->linesize,(AVPixelFormat)aframe->format,aframe->width);
+                if(encodeCtx->pix_fmt != format) {
+                    //Hardware encoder; special allocation
+                    hwframe = av_frame_alloc();
+                    hwframe->format = aframe->format;
+                     hwframe->pts = aframe->pts;
+                    if(av_hwframe_get_buffer(encodeCtx->hw_frames_ctx,hwframe,0)) {
+                        printf("failed to get buffer\n");
+                        abort();
+                    }
+                    AVPixelFormat* formats;
+
+
+                    if(av_hwframe_map(aframe,hwframe,AV_HWFRAME_MAP_WRITE)) {
+                        printf("UNABLE TO MAP HWFRAME\n");
+                        abort();
+                    }
+
+                }else {
+                   av_frame_get_buffer(aframe,0);
+                }
+                frame.map(QAbstractVideoBuffer::MapMode::ReadOnly);
+                const unsigned char* bits = frame.bits();
+                if(!bits) {
+                    printf("FATAL: UNABLE TO GET FRAME BITS\n");
+                    abort();
+                }
+                int stride = 4*frame.width();
+                sws_scale(scaler,&bits,&stride,0,frame.height(),aframe->data,aframe->linesize);
+                frame.unmap();
+
+
+                int status = 0;
+                if(hwframe) {
+                    av_frame_unref(aframe);
+                    avcodec_send_frame(encodeCtx,hwframe);
+                    av_frame_free(&hwframe);
+                }else {
+                    avcodec_send_frame(encodeCtx,aframe);
+                }
+                av_frame_free(&aframe);
+                AVPacket* packet = av_packet_alloc();
+                if(!avcodec_receive_packet(encodeCtx,packet)) {
+                    //Got packet?
+                    emit packetAvailable(packet);
+                }else {
+                    av_packet_free(&packet);
+                }
+                pts+=60;
+            }
+        }
+        avcodec_free_context(&encodeCtx);
+        sws_freeContext(scaler);
+    }
 
     MediaEncoder() {
         encoder = new std::thread([=](){
-            while(running) {
-                std::unique_lock<std::mutex> l(mtx);
-                evt.wait(l);
-                std::queue<QVideoFrame> frames = pendingFrames;
-                pendingFrames = std::queue<QVideoFrame>();
-                l.unlock();
-                while(frames.size()) {
-                    QVideoFrame frame = frames.front();
-                    frames.pop();
-                    AVPixelFormat fmt = AV_PIX_FMT_YUV420P;
-                    format = fmt;
-                    if(encodeCtx == nullptr) {
-                        codec_init(frame.width(),frame.height());
-                    }
-                    if(!(frame.width() == encodeCtx->width && frame.height() == encodeCtx->height)) {
-                        codec_init(frame.width(),frame.height());
-                    }
-                    AVFrame* aframe = av_frame_alloc();
-                    AVFrame* hwframe = 0;
-                    aframe->pts = ((double)frame.startTime()/1000.0/1000.0)*60.0;
-                    aframe->width = frame.width();
-                    aframe->height = frame.height();
-                    aframe->format = format;
-                    av_image_fill_linesizes(aframe->linesize,(AVPixelFormat)aframe->format,aframe->width);
-                    if(encodeCtx->pix_fmt != format) {
-                        //Hardware encoder; special allocation
-                        hwframe = av_frame_alloc();
-                        hwframe->format = aframe->format;
-                         hwframe->pts = aframe->pts;
-                        if(av_hwframe_get_buffer(encodeCtx->hw_frames_ctx,hwframe,0)) {
-                            printf("failed to get buffer\n");
-                        }
-                        AVPixelFormat* formats;
-
-
-                        av_hwframe_map(aframe,hwframe,AV_HWFRAME_MAP_WRITE);
-
-                    }else {
-                       av_frame_get_buffer(aframe,0);
-                    }
-                    frame.map(QAbstractVideoBuffer::MapMode::ReadOnly);
-                    const unsigned char* bits = frame.bits();
-                    int stride = 4*frame.width();
-                    sws_scale(scaler,&bits,&stride,0,frame.height(),aframe->data,aframe->linesize);
-                    frame.unmap();
-
-
-                    int status = 0;
-                    if(hwframe) {
-                        av_frame_unref(aframe);
-                        avcodec_send_frame(encodeCtx,hwframe);
-                        av_frame_free(&hwframe);
-                    }else {
-                        avcodec_send_frame(encodeCtx,aframe);
-                    }
-                    av_frame_free(&aframe);
-                    AVPacket* packet = av_packet_alloc();
-                    if(!avcodec_receive_packet(encodeCtx,packet)) {
-                        //Got packet?
-                        emit packetAvailable(packet);
-                    }else {
-                        av_packet_free(&packet);
-                    }
-                    pts+=60;
-                }
-            }
-            avcodec_free_context(&encodeCtx);
-            sws_freeContext(scaler);
+            encode_thread();
         });
     }
 
@@ -134,33 +145,16 @@ public:
             sws_freeContext(scaler);
         }
         scaler = sws_getContext(width,height,AV_PIX_FMT_BGR32,width,height,format,SWS_BICUBIC,0,0,0);
-        AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-
-        AVHWAccel* accel = 0;
-        while(accel = av_hwaccel_next(accel)) {
-            if(accel->id == AV_CODEC_ID_H264 && accel->pix_fmt == AV_PIX_FMT_VAAPI_VLD) {
-                codec = avcodec_find_encoder_by_name("h264_vaapi");
-                break;
-            }
-        }
-
-        if(!accel) {
-            printf("WARNING: Your hardware or software configuration does not support accelerated video encoding.\n");
-        }
-
+        AVCodec* codec = avcodec_find_encoder_by_name("h264_vaapi");
 
         encodeCtx = avcodec_alloc_context3(codec);
-        encodeCtx->hwaccel = accel;
         encodeCtx->time_base.den = 60;
         encodeCtx->time_base.num = 1;
-        encodeCtx->pix_fmt = format;
-        if(accel) {
-            encodeCtx->pix_fmt = accel->pix_fmt;
-        }
+        encodeCtx->pix_fmt = AV_PIX_FMT_VAAPI_VLD;
+
         encodeCtx->width = width;
         encodeCtx->height = height;
 
-        if(accel) {
         if(av_hwdevice_ctx_create(&encodeCtx->hw_device_ctx,AV_HWDEVICE_TYPE_VAAPI,0,0,0)) {
             printf("Unable to open hardware context\n");
         }else {
@@ -178,7 +172,7 @@ public:
             }
 
         }
-        }
+
         avcodec_open2(encodeCtx,codec,0);
         emit initialized();
     }
@@ -232,15 +226,6 @@ public:
 
             AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
 
-            while(accel = av_hwaccel_next(accel)) {
-                if(accel->id == AV_CODEC_ID_H264 && accel->pix_fmt == AV_PIX_FMT_VAAPI_VLD) {
-                    break;
-                }
-
-            }
-            if(!accel) {
-                printf("No HW-accelerated decoder found.\n");
-            }
 
 
             context = avcodec_alloc_context3(codec);
@@ -251,26 +236,24 @@ public:
             context->width = width;
             context->height = height;
 
-            if(accel) {
-                //context->hwaccel = accel;
-               // av_hwdevice_ctx_create(&context->hw_device_ctx,AV_HWDEVICE_TYPE_VAAPI,0,0,0);
-                //context->hwaccel_context = ((AVHWDeviceContext*)context->hw_device_ctx->data)->hwctx;
-                context->pix_fmt = AV_PIX_FMT_QSV;
-               // context->hwaccel = accel;
-                //TODO find hwaccel  (name) == h264_vaapi
-                /*context->hw_frames_ctx = av_hwframe_ctx_alloc(context->hw_device_ctx);
-                AVHWFramesContext* framectx = (AVHWFramesContext*)context->hw_frames_ctx->data; //Why isn't this better documented? It's not really a byte array....
-                //TODO: Will this break on non-Intel CPUs?
-                framectx->format = AV_PIX_FMT_VAAPI_VLD;
-                framectx->width = context->width;
-                framectx->height = context->height;
-                framectx->sw_format = pixelFormat;
+/*
+            if(!av_hwdevice_ctx_create(&context->hw_device_ctx,AV_HWDEVICE_TYPE_VAAPI,0,0,0)) {
+            context->hw_frames_ctx = av_hwframe_ctx_alloc(context->hw_device_ctx);
+            AVHWFramesContext* framectx = (AVHWFramesContext*)context->hw_frames_ctx->data; //Why isn't this better documented? It's not really a byte array....
+            //TODO: Will this break on non-Intel CPUs?
+            framectx->format = AV_PIX_FMT_VAAPI_VLD;
+            framectx->width = width;
+            framectx->height = height;
+            framectx->sw_format = AV_PIX_FMT_NV12;
 
-                if(av_hwframe_ctx_init(context->hw_frames_ctx)) {
-                    printf("Failed to start decoder\n");
-                }*/
-
+            if(av_hwframe_ctx_init(context->hw_frames_ctx)) {
+                printf("Failed to start encoder\n");
+                abort();
             }
+            }
+
+*/
+
             avcodec_open2(context,context->codec,0);
 
             printf("Decode: Using hwaccel %p\n",context->hwaccel);
