@@ -148,14 +148,17 @@ public:
         AVCodec* codec = avcodec_find_encoder_by_name("h264_vaapi");
 
         encodeCtx = avcodec_alloc_context3(codec);
+        encodeCtx->profile = FF_PROFILE_H264_BASELINE;
+        //encodeCtx->bit_rate = 700000;
         encodeCtx->time_base.den = 60;
         encodeCtx->time_base.num = 1;
         encodeCtx->pix_fmt = AV_PIX_FMT_VAAPI_VLD;
 
         encodeCtx->width = width;
         encodeCtx->height = height;
-
-        if(av_hwdevice_ctx_create(&encodeCtx->hw_device_ctx,AV_HWDEVICE_TYPE_VAAPI,0,0,0)) {
+        AVDictionary* opts = 0;
+        av_dict_set(&opts,"quality","5",0);
+        if(av_hwdevice_ctx_create(&encodeCtx->hw_device_ctx,AV_HWDEVICE_TYPE_VAAPI,0,opts,0)) {
             printf("Unable to open hardware context\n");
         }else {
             encodeCtx->hw_frames_ctx = av_hwframe_ctx_alloc(encodeCtx->hw_device_ctx);
@@ -221,83 +224,94 @@ public:
     MediaDecoder(AVPixelFormat pixelFormat, int width, int height, QObject* owner = nullptr):QObject(owner) {
         pixelFormat = AV_PIX_FMT_YUV420P;
         decoderThread = new std::thread([=](){
-
-            AVHWAccel* accel = 0;
-
-            AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
-
-
-
-            context = avcodec_alloc_context3(codec);
-
-            context->time_base.num = 1;
-            context->time_base.den = 60;
-            context->pix_fmt = pixelFormat;
-            context->width = width;
-            context->height = height;
-
-/*
-            if(!av_hwdevice_ctx_create(&context->hw_device_ctx,AV_HWDEVICE_TYPE_VAAPI,0,0,0)) {
-            context->hw_frames_ctx = av_hwframe_ctx_alloc(context->hw_device_ctx);
-            AVHWFramesContext* framectx = (AVHWFramesContext*)context->hw_frames_ctx->data; //Why isn't this better documented? It's not really a byte array....
-            //TODO: Will this break on non-Intel CPUs?
-            framectx->format = AV_PIX_FMT_VAAPI_VLD;
-            framectx->width = width;
-            framectx->height = height;
-            framectx->sw_format = AV_PIX_FMT_NV12;
-
-            if(av_hwframe_ctx_init(context->hw_frames_ctx)) {
-                printf("Failed to start encoder\n");
-                abort();
-            }
-            }
-
-*/
-
-            avcodec_open2(context,context->codec,0);
-
-            printf("Decode: Using hwaccel %p\n",context->hwaccel);
-            scaler = sws_getContext(width,height,pixelFormat,width,height,AV_PIX_FMT_RGBA,SWS_BICUBIC,0,0,0);
-
-
-            while(running) {
-                std::unique_lock<std::mutex> l(mtx);
-                while(!pendingPackets.size() && running) {
-                    evt.wait(l);
-                }
-                std::queue<AVPacket*> packets = pendingPackets;
-                pendingPackets = std::queue<AVPacket*>();
-                l.unlock();
-
-                while(packets.size()) {
-                AVPacket* packet = packets.front();
-                packets.pop();
-                    avcodec_send_packet(context,packet);
-                AVFrame* frame = av_frame_alloc();
-                if(!avcodec_receive_frame(context,frame)) {
-                    unsigned char* mander = new unsigned char[frame->width*frame->height*4];
-                    int stride = 4*frame->width;
-                    sws_scale(scaler,frame->data,frame->linesize,0,frame->height,&mander,&stride);
-                    emit frameAvailable(new VideoFrame(mander,frame->width,frame->height));
-                    av_frame_free(&frame);
-                }else {
-                    av_frame_free(&frame);
-                }
-                av_packet_free(&packet);
-                }
-            }
-
-            std::unique_lock<std::mutex> l(mtx);
-            while(pendingPackets.size()) {
-                AVPacket* packet = pendingPackets.front();
-                pendingPackets.pop();
-                av_packet_free(&packet);
-                sws_freeContext(scaler);
-                avcodec_free_context(&context);
-            }
+            decoder_thread(pixelFormat,width,height,owner);
         });
 
     }
+    void decoder_thread(AVPixelFormat pixelFormat, int width, int height, QObject* owner) {
+
+        AVHWAccel* accel = 0;
+
+        AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+
+
+
+        context = avcodec_alloc_context3(codec);
+
+        context->time_base.num = 1;
+        context->time_base.den = 60;
+        context->pix_fmt = pixelFormat;
+        context->width = width;
+        context->height = height;
+
+
+        if(!av_hwdevice_ctx_create(&context->hw_device_ctx,AV_HWDEVICE_TYPE_VAAPI,0,0,0)) {
+        context->hw_frames_ctx = av_hwframe_ctx_alloc(context->hw_device_ctx);
+        AVHWFramesContext* framectx = (AVHWFramesContext*)context->hw_frames_ctx->data; //Why isn't this better documented? It's not really a byte array....
+        //TODO: Will this break on non-Intel CPUs?
+        framectx->format = AV_PIX_FMT_VAAPI_VLD;
+        framectx->width = width;
+        framectx->height = height;
+        framectx->sw_format = AV_PIX_FMT_NV12;
+
+        if(av_hwframe_ctx_init(context->hw_frames_ctx)) {
+            printf("Failed to start encoder\n");
+            abort();
+        }
+        }
+
+
+
+        avcodec_open2(context,context->codec,0);
+
+        printf("Decode: Using hwaccel %p\n",context->hwaccel);
+        scaler = sws_getContext(width,height,pixelFormat,width,height,AV_PIX_FMT_RGBA,SWS_BICUBIC,0,0,0);
+
+
+        while(running) {
+            std::unique_lock<std::mutex> l(mtx);
+            while(!pendingPackets.size() && running) {
+                evt.wait(l);
+            }
+            std::queue<AVPacket*> packets = pendingPackets;
+            pendingPackets = std::queue<AVPacket*>();
+            l.unlock();
+
+            while(packets.size()) {
+            AVPacket* packet = packets.front();
+            packets.pop();
+                avcodec_send_packet(context,packet);
+            AVFrame* frame = av_frame_alloc();
+            if(!avcodec_receive_frame(context,frame)) {
+                unsigned char* mander = new unsigned char[frame->width*frame->height*4];
+                int stride = 4*frame->width;
+                AVFrame* aframe = av_frame_alloc();
+                aframe->format = pixelFormat;
+                if(av_hwframe_map(aframe,frame,AV_HWFRAME_MAP_READ)) {
+                                        printf("UNABLE TO MAP HWFRAME\n");
+                                        abort();
+                }
+                sws_scale(scaler,aframe->data,aframe->linesize,0,frame->height,&mander,&stride);
+                emit frameAvailable(new VideoFrame(mander,aframe->width,aframe->height));
+                av_frame_free(&aframe);
+                av_frame_free(&frame);
+            }else {
+                av_frame_free(&frame);
+            }
+            av_packet_free(&packet);
+            }
+        }
+
+        std::unique_lock<std::mutex> l(mtx);
+        while(pendingPackets.size()) {
+            AVPacket* packet = pendingPackets.front();
+            pendingPackets.pop();
+            av_packet_free(&packet);
+            sws_freeContext(scaler);
+            avcodec_free_context(&context);
+        }
+    }
+
     ~MediaDecoder() {
         running = false;
         evt.notify_one();
