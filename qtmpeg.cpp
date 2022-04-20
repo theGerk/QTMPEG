@@ -6,7 +6,6 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vaapi.h>
-#include <libavcodec/vaapi.h>
 }
 #include <queue>
 #include <mutex>
@@ -55,11 +54,12 @@ public:
 
     void encode_thread() {
         while(running) {
-            std::unique_lock<std::mutex> l(mtx);
-            evt.wait(l);
-            std::queue<QVideoFrame> frames = pendingFrames;
-            pendingFrames = std::queue<QVideoFrame>();
-            l.unlock();
+            std::queue<QVideoFrame> frames;
+            {
+                std::unique_lock<std::mutex> l(mtx);
+                evt.wait(l);
+                frames.swap(pendingFrames);
+            }
             while(frames.size()) {
                 QVideoFrame frame = frames.front();
                 frames.pop();
@@ -78,7 +78,7 @@ public:
                 aframe->height = frame.height();
                 aframe->format = fmt;
                 av_image_fill_linesizes(aframe->linesize,(AVPixelFormat)aframe->format,aframe->width);
-                if(encodeCtx->pix_fmt != format) {
+                if(encodeCtx->pix_fmt != format && encodeCtx->hw_frames_ctx) {
                     //Hardware encoder; special allocation
                     hwframe = av_frame_alloc();
                     hwframe->format = aframe->format;
@@ -145,27 +145,27 @@ public:
             sws_freeContext(scaler);
         }
         scaler = sws_getContext(width,height,AV_PIX_FMT_BGR32,width,height,format,SWS_BICUBIC,0,0,0);
-        AVCodec* codec = avcodec_find_encoder_by_name("h264_vaapi");
+        const AVCodec* codec = avcodec_find_encoder_by_name("h264_vaapi");
 
         encodeCtx = avcodec_alloc_context3(codec);
         encodeCtx->profile = FF_PROFILE_H264_BASELINE;
         //encodeCtx->bit_rate = 700000;
         encodeCtx->time_base.den = 60;
         encodeCtx->time_base.num = 1;
-        encodeCtx->pix_fmt = AV_PIX_FMT_VAAPI_VLD;
+        encodeCtx->pix_fmt = AV_PIX_FMT_VAAPI;
 
         encodeCtx->width = width;
         encodeCtx->height = height;
         AVDictionary* opts = 0;
         av_dict_set(&opts,"quality","5",0);
-        if(av_hwdevice_ctx_create(&encodeCtx->hw_device_ctx,AV_HWDEVICE_TYPE_VAAPI,0,opts,0)) {
+        if(av_hwdevice_ctx_create(&encodeCtx->hw_device_ctx,AV_HWDEVICE_TYPE_VAAPI,0,opts,0) || true) {
             printf("Unable to open hardware context\n");
         }else {
             encodeCtx->hw_frames_ctx = av_hwframe_ctx_alloc(encodeCtx->hw_device_ctx);
             AVHWFramesContext* framectx = (AVHWFramesContext*)encodeCtx->hw_frames_ctx->data; //Why isn't this better documented? It's not really a byte array....
             format = AV_PIX_FMT_NV12; //Why is this the only format that seems to work? (at least on Intel processors)?
             //TODO: Will this break on non-Intel CPUs?
-            framectx->format = AV_PIX_FMT_VAAPI_VLD;
+            framectx->format = AV_PIX_FMT_VAAPI;
             framectx->width = encodeCtx->width;
             framectx->height = encodeCtx->height;
             framectx->sw_format = format;
@@ -232,7 +232,7 @@ public:
 
         AVHWAccel* accel = 0;
 
-        AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+        const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
 
 
 
@@ -249,7 +249,7 @@ public:
         context->hw_frames_ctx = av_hwframe_ctx_alloc(context->hw_device_ctx);
         AVHWFramesContext* framectx = (AVHWFramesContext*)context->hw_frames_ctx->data; //Why isn't this better documented? It's not really a byte array....
         //TODO: Will this break on non-Intel CPUs?
-        framectx->format = AV_PIX_FMT_VAAPI_VLD;
+        framectx->format = AV_PIX_FMT_VAAPI;
         framectx->width = width;
         framectx->height = height;
         framectx->sw_format = AV_PIX_FMT_NV12;
@@ -378,7 +378,6 @@ AbstractMediaPlayer* MediaServer::createMediaPlayer() {
 
 MediaServer::MediaServer(QObject *parent) : QObject(parent)
 {
-    av_register_all();
     //av_log_set_level(AV_LOG_DEBUG);
 }
 
